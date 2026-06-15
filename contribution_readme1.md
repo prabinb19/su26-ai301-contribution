@@ -3,7 +3,7 @@
 **Contribution Number:** 1  
 **Student:** Prabin Bajgai  
 **Issue:** https://github.com/angular/components/issues/27412  
-**Status:** Phase I Complete
+**Status:** Phase II Complete
 
 ---
 
@@ -31,19 +31,27 @@ taken and confirm the issue is still genuinely open before investing further.
 
 ### Problem Description
 
-[In your own words, what's broken or missing?]
+Typing a date like `2023-07-06` into a Material datepicker and clicking away turns it into
+`7/5/2023`, a day early. It only happens when your timezone is behind UTC. The cause is that two
+parts of `NativeDateAdapter` read the date in different timezones: `parse()` reads the string as UTC,
+and `format()` later reads it back by its local calendar day. Behind UTC those two readings are off
+by the offset, so the day drops by one.
 
 ### Expected Behavior
 
-[What should happen?]
+Type `2023-07-06`, get `7/6/2023`. Same day, just reformatted.
 
 ### Current Behavior
 
-[What actually happens?]
+Type `2023-07-06`, get `7/5/2023` (a day behind), but only in behind-UTC timezones. Zones ahead of
+UTC like Europe/Brussels show the right day.
 
 ### Affected Components
 
-[Which parts of the codebase are involved?]
+- `src/material/core/datetime/native-date-adapter.ts`. `parse()` is where the bug is, and
+  `_format()` is the formatting code it conflicts with.
+- `src/material/datepicker/datepicker-input-base.ts`. The `_onInput` → `_onBlur` → `_formatValue`
+  chain that calls `parse()` and then `format()`.
 
 ---
 
@@ -51,19 +59,46 @@ taken and confirm the issue is still genuinely open before investing further.
 
 ### Environment Setup
 
-[Notes on setting up your local development environment - challenges you faced, how you solved them]
+Cloned my fork (Bazel monorepo, datepicker demo runs with `yarn dev-app`). The thing that tripped me
+up is that the bug depends on your timezone, so it won't show up on a normal machine that's ahead of
+UTC. I got a behind-UTC zone two ways: by running the logic under Node with the `TZ` variable set,
+which works no matter what my laptop's clock says, and by overriding the browser timezone in Chrome
+DevTools. Worth noting that the date math runs in the browser, not the Node devserver, so a `TZ=`
+prefix on `yarn dev-app` doesn't change anything on its own.
 
 ### Steps to Reproduce
 
-1. [Step 1]
-2. [Step 2]
-3. [Observed result]
+1. Run `yarn dev-app` and open the datepicker overview demo.
+2. Set the browser timezone to a behind-UTC zone (DevTools, "Show Sensors", America/Chicago).
+3. Type `2023-07-06` into the input and click away.
+4. Expected `7/6/2023`, but you get `7/5/2023`.
+
+If you'd rather skip the browser settings, this runs the same `parse()` and `_format()` logic:
+
+```bash
+TZ="America/Chicago" node -e '
+  function parse(v){ return v ? new Date(Date.parse(v)) : null; }
+  function format(date){
+    const dtf = new Intl.DateTimeFormat("en-US",{year:"numeric",month:"numeric",day:"numeric",timeZone:"utc"});
+    const d = new Date();
+    d.setUTCFullYear(date.getFullYear(), date.getMonth(), date.getDate());
+    d.setUTCHours(date.getHours(), date.getMinutes(), date.getSeconds(), date.getMilliseconds());
+    return dtf.format(d);
+  }
+  console.log(format(parse("2023-07-06")));   // -> 7/5/2023 (bug); Europe/Brussels -> 7/6/2023
+'
+```
 
 ### Reproduction Evidence
 
-- **Commit showing reproduction:** [Link to commit in your fork]
-- **Screenshots/logs:** [If applicable]
-- **My findings:** [What you discovered during reproduction]
+- **Branch:** https://github.com/prabinb19/components/tree/fix-issue-27412
+- **What I found:** `Date.parse("2023-07-06")` gives UTC midnight, which in GMT-5 is `Jul 05 19:00`
+  on the local clock. I traced the path the value takes: `parse()`, then `getValidDateOrNull()`
+  which only validates and doesn't change the date, then `format()`, then `_format()`. Nothing in
+  there converts back to local time. `_format()` reads the local getters and copies them onto a UTC
+  instant, so whatever local day the date has is the day you see. Since `parse` produced a date whose
+  local day is the 5th, that's what shows up. The two methods just aren't using the same timezone.
+  Fuller notes and a multi-timezone check are in `phase2_reproduce_and_plan.md`.
 
 ---
 
@@ -71,30 +106,47 @@ taken and confirm the issue is still genuinely open before investing further.
 
 ### Analysis
 
-[Your analysis of the root cause - what's causing the issue?]
+JavaScript has an awkward rule here. A bare date string like `2023-07-06` is parsed as UTC midnight,
+but a date with a time and no offset is parsed as local. `parse()` hands the string straight to
+`Date.parse()`, so it picks up the UTC reading. The rest of the adapter works in local time, which
+leaves this one value as the odd one out, and behind UTC it reads back as yesterday.
 
 ### Proposed Solution
 
-[High-level description of your fix approach]
+Get `parse()` working in local time like everything else in the adapter. When the input is a plain
+date with no time, build it from its pieces (`new Date(year, month - 1, day)`) instead of calling
+`Date.parse()`. Then the local day always matches what was typed, in any timezone, and `_format()`
+shows it unchanged. I want to keep this small, so only bare `YYYY-MM-DD` strings take the new path.
+Anything with a time or an explicit `Z`/offset still goes through `Date.parse()` since those already
+say what timezone they mean. Two older PRs (#27495 and #27835) tried a larger locale-aware rewrite; I
+don't want to go that far, since a maintainer noted the adapter is meant to stay simple.
 
 ### Implementation Plan
 
 Using UMPIRE framework (adapted):
 
-**Understand:** [Restate the problem]
+**Understand:** `2023-07-06` shows up as `7/5/2023` in behind-UTC zones because `parse()` reads the
+string as UTC midnight while `format()` reads dates by their local day.
 
-**Match:** [What similar patterns/solutions exist in the codebase?]
+**Match:** `deserialize()` already checks strings against `ISO_8601_REGEX` before building a `Date`,
+so there's precedent for testing the string's shape first. `_createDateWithOverflow()` is a good
+reference for the local-component style used elsewhere in the file.
 
-**Plan:** [Step-by-step implementation plan]
-1. [Modify file X to do Y]
-2. [Add function Z]
-3. [Update tests]
+**Plan:**
+1. Add a date-only check (`^\d{4}-\d{2}-\d{2}$`) inside `parse()` in `native-date-adapter.ts`.
+2. If it matches, split out year/month/day and build the date locally. If not, leave the existing
+   `Date.parse()` path alone.
+3. Add tests in `native-date-adapter.spec.ts`.
 
-**Implement:** [Link to your branch/commits as you work]
+**Implement:** https://github.com/prabinb19/components/tree/fix-issue-27412 *(Phase III)*
 
-**Review:** [Self-review checklist - does it follow the project's contribution guidelines?]
+**Review:** Read `CONTRIBUTING.md` and the Google TypeScript style guide before the PR, and follow
+the repo's commit format (`type(scope): summary`, e.g. `fix(material/core): parse date-only ISO
+strings in local time`). Keep the change small.
 
-**Evaluate:** [How will you verify it works?]
+**Evaluate:** Unit tests in `native-date-adapter.spec.ts`; re-run the Node check across
+Chicago/Brussels/Kolkata/Kiritimati to confirm `2023-07-06` gives `7/6/2023` everywhere without
+breaking the zones that already worked; make sure the existing `deserialize` ISO tests still pass.
 
 ---
 
