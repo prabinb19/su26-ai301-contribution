@@ -3,7 +3,7 @@
 **Contribution Number:** 1  
 **Student:** Prabin Bajgai  
 **Issue:** https://github.com/angular/components/issues/27412  
-**Status:** Phase II Complete
+**Status:** Phase III In Progress
 
 ---
 
@@ -154,36 +154,75 @@ breaking the zones that already worked; make sure the existing `deserialize` ISO
 
 ### Unit Tests
 
-- [ ] Test case 1: [Description]
-- [ ] Test case 2: [Description]
-- [ ] Test case 3: [Description]
+- [x] Test case 1: a bare `2023-07-06` parses to the day typed (the 6th), not the 5th
+- [ ] Test case 2: full datetime / `Z` / offset strings still go through `Date.parse()` (no regression)
+- [ ] Test case 3: edge cases — single-digit month/day, leap day (`2024-02-29`), end-of-month
 
 ### Integration Tests
 
-- [ ] Integration scenario 1
-- [ ] Integration scenario 2
+- [ ] Integration scenario 1: datepicker input round-trips a typed `YYYY-MM-DD` value end to end
+- [ ] Integration scenario 2: date range picker behaves correctly
 
 ### Manual Testing
 
-[What you tested manually and results]
+After the fix I ran the Node check from the reproduction step again for America/Chicago and
+Europe/Brussels. Both print `7/6/2023` now. I still want to try a couple of other offsets and see it
+in the real dev-app in the browser, but that's next week.
 
 ---
 
 ## Implementation Notes
 
-### Week [X] Progress
+### Week 1 Progress
 
-[What you built this week, challenges faced, decisions made]
+Got the fix in and one test passing. That's all I did this week. I wanted to keep it to the actual
+parse change and leave the rest of the tests and the browser check for next week.
 
-### Week [Y] Progress
+The change is in `native-date-adapter.ts`. `parse()` used to just pass the string to `Date.parse()`.
+I added a check before that line: if the string is a plain `YYYY-MM-DD`, build the date from its
+parts in local time instead. Local time is what the rest of the adapter works in, so this lines it
+up with everything else.
 
-[Continue documenting as you work]
+```ts
+// A date-only ISO 8601 string (YYYY-MM-DD) is parsed by `Date.parse` as UTC midnight, which
+// rolls the calendar day back by one in behind-UTC timezones. Build it from its parts in local
+// time instead so the day matches what was entered. Strings that carry a time or an explicit
+// offset already declare their timezone, so they keep going through `Date.parse`.
+if (typeof value === 'string' && /^\d{4}-\d{2}-\d{2}$/.test(value)) {
+  const [year, month, day] = value.split('-').map(Number);
+  return new Date(year, month - 1, day);
+}
+```
+
+The regex is strict on purpose. Only an exact `YYYY-MM-DD` hits the new branch, so anything with a
+time or an offset still goes through `Date.parse()` like before. I didn't want to change how those
+behave.
+
+First test went in `native-date-adapter.spec.ts`. I had to add `JUL` to the import that was already
+there, then dropped a case in right after `'should parse string'`:
+
+```ts
+it('should parse a date-only ISO string to local midnight on the entered day', () => {
+  expect(adapter.parse('2023-07-06')).toEqual(new Date(2023, JUL, 6));
+});
+```
+
+### Next week
+
+- Add a test that datetime/offset strings still use `Date.parse()`.
+- Add the edge-case tests.
+- Run the dev-app in a behind-UTC browser timezone to check the fix end to end.
+- Make sure the existing `deserialize` ISO tests still pass, then start the self-review against
+  `CONTRIBUTING.md`.
 
 ### Code Changes
 
-- **Files modified:** [List]
-- **Key commits:** [Links to important commits]
-- **Approach decisions:** [Why you chose certain approaches]
+- **Files modified:** `src/material/core/datetime/native-date-adapter.ts`,
+  `src/material/core/datetime/native-date-adapter.spec.ts`
+- **Branch:** https://github.com/prabinb19/components/tree/fix-issue-27412
+- **Approach decisions:** went with the small fix on bare date strings instead of the bigger
+  locale-aware parsing rewrite the two earlier PRs (#27495 / #27835) tried. A maintainer said the
+  `NativeDateAdapter` should stay simple, so the narrow change felt like the safer bet.
 
 ---
 
